@@ -12,12 +12,13 @@
 #    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
-
+import os
 import copy
 import random
 from dataclasses import dataclass, field
 import json
 import pathlib
+from PIL import Image
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -25,22 +26,9 @@ from torch.utils.data import Dataset
 import transformers
 from transformers import Trainer
 from transformers.trainer_pt_utils import LabelSmoother
-import os
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from chunkllama_attn_replace import replace_with_chunkllama
+from transformers import get_cosine_schedule_with_warmup, AutoProcessor, BlipForConditionalGeneration, BlipForQuestionAnswering
+from blip.model import BlipLDPNetV2ForConditionalGeneration, BlipVisionAeForQuestionAnswering
 
-
-IGNORE_TOKEN_ID = LabelSmoother.ignore_index
-
-#### Setting for Llama2
-B_INST, E_INST = "[INST]", "[/INST]"
-BOS, EOS = "<s>", "</s>"
-B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
-DEFAULT_SYSTEM_PROMPT = """\
-You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
-
-If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."""
 
 
 @dataclass
@@ -114,68 +102,12 @@ def write_jsonl(data, fn):
             print(json.dumps(line), file=f)
 
 
-def preprocess_shrotprompt(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    conversations = []
-    for source in sources:
-        inputs = source["inputs"]
-        outputs = source["outputs"]
-        whole_sequence = f"{BOS}{B_INST} {B_SYS} {DEFAULT_SYSTEM_PROMPT} {E_SYS} {inputs[0]} {E_INST} {outputs[0]} {EOS}"
-        if len(inputs) > 1 and len(outputs) > 1 and len(inputs)==len(outputs):
-            for i in range(1, len(inputs)):
-                whole_sequence += f"{BOS}{B_INST} {inputs[i]} {E_INST} {outputs[i]} {EOS}"
-        conversations.append(whole_sequence)
-    # Tokenize conversations
-    rank0_write(conversations[0])
-
-    input_ids = tokenizer(
-        conversations,
-        return_tensors="pt",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    ).input_ids
-    targets = input_ids.clone()
-    sep = E_INST
-    for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
-        rounds = conversation.split(EOS)
-        cur_len = 1
-        for i, rou in enumerate(rounds):
-            if rou == "":
-                break
-
-            parts = rou.split(sep)
-            if len(parts) != 2:
-                break
-            parts[0] += sep
-            round_len = len(tokenizer(rou).input_ids)
-            instruction_len = len(tokenizer(parts[0]).input_ids) - 2
-
-            target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
-
-            cur_len += round_len
-        target[cur_len:] = IGNORE_TOKEN_ID
-        if cur_len < tokenizer.model_max_length:
-            if cur_len != total_len:
-                rank0_print(
-                    f"WARNING: tokenization mismatch " f"{cur_len} vs. {total_len}"
-                )
-
-    return dict(
-        input_ids=input_ids,
-        labels=targets,
-        attention_mask=input_ids.ne(tokenizer.pad_token_id),
-    )
-
-
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(self, data_path: str, processor, num_data: int):
         super(LazySupervisedDataset, self).__init__()
-        self.tokenizer = tokenizer
+        self.processor = processor
 
         rank0_print("Loading data...")
         # load data
@@ -199,36 +131,27 @@ class LazySupervisedDataset(Dataset):
         question = self.list_data_dict[i]['question']
         answer = self.list_data_dict[i]['answer']
         image = Image.open(image_path)
-        inputs = processor(images=images,
-                       text=questions,
+        inputs = self.processor(images=image,
+                       text=question,
                        return_tensors="pt",
                        padding=True,
                        truncation=True)
-        labels = processor(text=answers,
+        labels = self.processor(text=answer,
                         return_tensors="pt",
                         padding=True,
                         truncation=True).input_ids
+        inputs['labels'] = labels
         
-        if isinstance(i, int):
-            sources = [sources]
-        data_dict = preprocess_shrotprompt(sources, self.tokenizer)
-        if isinstance(i, int):
-            data_dict = dict(
-                input_ids=data_dict["input_ids"][0],
-                labels=data_dict["labels"][0],
-                attention_mask=data_dict["attention_mask"][0],
-            )
-        return data_dict
+        for key, value in inputs:
+            inputs[key] = value[0]
+        return inputs
 
 
 def make_supervised_data_module(
-    tokenizer: transformers.PreTrainedTokenizer, data_args
+    processor, data_args
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    dataset_cls = (
-        LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
-    )
-    train_dataset = dataset_cls(tokenizer=tokenizer, data_path=data_args.data_path, num_data=data_args.num_data)
+    train_dataset = LazySupervisedDataset(processor=processor, data_path=data_args.data_path, num_data=data_args.num_data)
     return dict(train_dataset=train_dataset, eval_dataset=None)
 
 
@@ -240,26 +163,17 @@ def train():
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    replace_with_chunkllama(training_args.pretraining_length)
 
     local_rank = training_args.local_rank
-    model = transformers.AutoModelForCausalLM.from_pretrained(
+    model = BlipVisionAeForQuestionAnswering.from_pretrained(
         model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
     )
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        use_fast=False,
-    )
-    tokenizer.pad_token = tokenizer.unk_token
+    processor = AutoProcessor.from_pretrained("./ckpts/blip-vqa-capfilt-large")
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    data_module = make_supervised_data_module(tokenizer=processor, data_args=data_args)
 
     trainer = Trainer(
-        model=model, tokenizer=tokenizer, args=training_args, **data_module
+        model=model, tokenizer=processor, args=training_args, **data_module
     )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
