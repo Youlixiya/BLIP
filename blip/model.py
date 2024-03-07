@@ -103,25 +103,55 @@ class LDPNetV2Projector(nn.Module):
         x = self.peg(x)
         return x
     
+# class VisionAutoencoder(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.encoder = nn.Sequential(
+#             nn.Linear(config.hidden_size, config.hidden_size // 2),
+#             nn.SiLU(),
+#             nn.Linear(config.hidden_size // 2, config.hidden_size // 4)
+#         )
+#         self.decoder = nn.Sequential(
+#             nn.Linear(config.hidden_size // 4, config.hidden_size // 2),
+#             nn.SiLU(),
+#             nn.Linear(config.hidden_size // 2, config.hidden_size)
+#         )
+    
+#     def encode(self, x):
+#         return self.encoder(x)
+    
+#     def decode(self, x):
+#         return self.decoder(x)
+    
+#     def forward(self, x):
+#         return self.decode(self.encode(x))
+
 class VisionAutoencoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.ConvTranspose2d(config.hidden_size, config.hidden_size // 2, 3, 2, padding=1, output_padding=1),
             nn.SiLU(),
-            nn.Linear(config.hidden_size // 2, config.hidden_size // 4)
+            nn.ConvTranspose2d(config.hidden_size // 2, config.hidden_size // 4, 3, 2, padding=1, output_padding=1)
         )
         self.decoder = nn.Sequential(
-            nn.Linear(config.hidden_size // 4, config.hidden_size // 2),
+            nn.Conv2d(config.hidden_size // 4, config.hidden_size // 2, 3, 2, padding=1),
             nn.SiLU(),
-            nn.Linear(config.hidden_size // 2, config.hidden_size)
+            nn.Conv2d(config.hidden_size // 2, config.hidden_size, 3, 2, padding=1)
         )
     
     def encode(self, x):
+        b, num_tokens, c = x.shape
+        # print(num_tokens)
+        h = int(math.sqrt(num_tokens))
+        assert h * h == num_tokens
+        x = x.transpose(1, 2).view(b, c, h, h)
         return self.encoder(x)
     
     def decode(self, x):
-        return self.decoder(x)
+        x = self.decoder(x)
+        b, c, h, w = x.shape
+        return x.reshape(b, c, -1).permute(0, 2, 1)
     
     def forward(self, x):
         return self.decode(self.encode(x))
@@ -356,7 +386,7 @@ class BlipVisionAeForQuestionAnswering(BlipForQuestionAnswering):
                 return_dict=return_dict,
             )
 
-            image_embeds = vision_outputs[0]
+            image_embeds = vision_outputs[0][:, 1:, :]
             image_embeds_encoded = self.vision_ae.encode(image_embeds)
             image_embeds = self.vision_ae.decode(image_embeds_encoded)
         image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long)
@@ -450,6 +480,7 @@ class BlipVisionAeForQuestionAnswering(BlipForQuestionAnswering):
             vision_outputs = self.vision_model(pixel_values=pixel_values)
 
             image_embeds = vision_outputs[0]
+            image_embeds = image_embeds[:, 1:, :]
             image_embeds_encoded = self.vision_ae.encode(image_embeds)
             image_embeds = self.vision_ae.decode(image_embeds_encoded)
         

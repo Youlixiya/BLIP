@@ -27,6 +27,7 @@ import transformers
 from transformers import Trainer
 from transformers.trainer_pt_utils import LabelSmoother
 from transformers import get_cosine_schedule_with_warmup, AutoProcessor, BlipForConditionalGeneration, BlipForQuestionAnswering
+from transformers.models.blip.processing_blip import BlipProcessor
 from blip.model import BlipLDPNetV2ForConditionalGeneration, BlipVisionAeForQuestionAnswering
 
 
@@ -126,33 +127,50 @@ class LazySupervisedDataset(Dataset):
         return len(self.list_data_dict)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        image_path = os.path.join('data', self.list_data_dict[i]['image'])
+        image_path = self.list_data_dict[i]['image']
         # caption = self.datas[index]['caption'] + ' [SEP]'
         question = self.list_data_dict[i]['question']
         answer = self.list_data_dict[i]['answer']
         image = Image.open(image_path)
-        inputs = self.processor(images=image,
-                       text=question,
-                       return_tensors="pt",
-                       padding=True,
-                       truncation=True)
-        labels = self.processor(text=answer,
+        return image, question, answer
+
+@dataclass
+class DataCollatorForSupervisedDataset(object):
+    """Collate examples for supervised fine-tuning."""
+
+    processor: BlipProcessor
+    def __call__(self, batch) -> Dict[str, torch.Tensor]:
+        images = []
+        questions = []
+        answers = []
+
+        for image, question, answer in batch:
+            images.append(image)
+            questions.append(question)
+            answers.append(answer)
+            
+        
+        inputs = self.processor(images=images,
+                        text=questions,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True)
+        labels = self.processor(text=answers,
                         return_tensors="pt",
                         padding=True,
                         truncation=True).input_ids
         inputs['labels'] = labels
-        
-        for key, value in inputs:
-            inputs[key] = value[0]
         return inputs
-
 
 def make_supervised_data_module(
     processor, data_args
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(processor=processor, data_path=data_args.data_path, num_data=data_args.num_data)
-    return dict(train_dataset=train_dataset, eval_dataset=None)
+    data_collator = DataCollatorForSupervisedDataset(processor=processor)
+    return dict(train_dataset=train_dataset,
+                eval_dataset=None,
+                data_collator=data_collator)
 
 
 def train():
@@ -168,12 +186,14 @@ def train():
     model = BlipVisionAeForQuestionAnswering.from_pretrained(
         model_args.model_name_or_path,
     )
-    processor = AutoProcessor.from_pretrained("./ckpts/blip-vqa-capfilt-large")
+    model.vision_model.requires_grad_(False)
+    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path,
+                                              model_max_length=training_args.model_max_length)
 
-    data_module = make_supervised_data_module(tokenizer=processor, data_args=data_args)
+    data_module = make_supervised_data_module(processor=processor, data_args=data_args)
 
     trainer = Trainer(
-        model=model, tokenizer=processor, args=training_args, **data_module
+        model=model, args=training_args, **data_module
     )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
